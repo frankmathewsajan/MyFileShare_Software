@@ -20,3 +20,4 @@ Thumbs.db
 # App Specific (Ignore local test transfers)
 recv_*
 *.zip
+contacts.json
