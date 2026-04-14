@@ -321,7 +321,7 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
             kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=480000)
             key = kdf.derive(self.my_session_pin.encode())
 
-            client_auth = conn.recv(32)
+            client_auth = self.recv_exact(conn, 32)
             expected_auth = hmac.new(key, b"AUTH_CHALLENGE", hashlib.sha256).digest()
             if not hmac.compare_digest(client_auth, expected_auth):
                 attempts = self.failed_attempts.get(ip, (0, 0))[0] + 1
@@ -359,7 +359,7 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
             if offset > 0: conn.sendall(f"RESUME|{offset}".encode())
             else: conn.sendall(b"START|0")
 
-            nonce = conn.recv(16)
+            nonce = self.recv_exact(conn, 16)
             decryptor = Cipher(algorithms.AES(key), modes.CTR(nonce)).decryptor()
             stream_mac = hmac.new(key, digestmod=hashlib.sha256)
             
@@ -391,7 +391,6 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 self.after(0, self.log, "Transfer paused or connection dropped. Data saved to resume later.")
                 return
 
-            # UPDATED SECURITY CHECK
             sender_mac = self.recv_exact(conn, 32)
             if not sender_mac or not hmac.compare_digest(stream_mac.digest(), sender_mac):
                 self.after(0, self.log, "🚨 SECURITY ALERT: Stream Tampering Detected! Segment dropped.")
@@ -533,15 +532,15 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
                     speed = ((sent - offset) / 1e6) / elapsed
                     self.after(0, self.update_ui_progress, pct, f"Speed: {speed:.2f} MB/s")
 
-                # UPDATED CLOSING LOGIC
                 if not self.cancel_transfer_flag.is_set() and not self.shutdown_flag.is_set():
-                    client.sendall(enc.finalize())
-                    stream_mac.update(enc.finalize())
+                    # THE FIX IS HERE: Save to a variable so we only call finalize() once!
+                    final_chunk = enc.finalize()
+                    client.sendall(final_chunk)
+                    stream_mac.update(final_chunk)
                     client.sendall(stream_mac.digest())
                     
-                    # Wait for the receiver's thumbs up before closing the socket
                     try:
-                        self.recv_exact(client, 4) # Waits for b"DONE"
+                        self.recv_exact(client, 4) 
                     except:
                         pass 
 
