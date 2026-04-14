@@ -27,6 +27,7 @@ from plyer import notification
 TCP_PORT = 49494
 UDP_PORT = 49495
 CONTACTS_FILE = "contacts.json"
+SOCKET_TIMEOUT = 20
 
 class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self):
@@ -55,6 +56,7 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         
         self.transfer_approved = False
         self.prompt_event = threading.Event()
+        self.approval_lock = threading.Lock()
 
         self.setup_ui()
         self.protocol("WM_DELETE_WINDOW", self.hide_window)
@@ -84,22 +86,26 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.title_label = ctk.CTkLabel(self, text="MyFileSharingSoftware", font=("Arial", 28, "bold"))
         self.title_label.pack(pady=(20, 10))
 
-        self.appearance_mode_optionemenu = ctk.CTkSegmentedButton(self, values=["Dark", "Light", "System"], command=ctk.set_appearance_mode)
+        self.appearance_mode_optionemenu = ctk.CTkSegmentedButton(self, values=["Dark", "Light", "System"], command=self.on_appearance_change)
         self.appearance_mode_optionemenu.set("Dark")
         self.appearance_mode_optionemenu.pack(pady=5)
 
         self.my_info_frame = ctk.CTkFrame(self, corner_radius=10, border_width=1, border_color="#00A2FF")
         self.my_info_frame.pack(pady=15, padx=20, fill="x")
         
-        ctk.CTkLabel(self.my_info_frame, text=f"DEVICE NAME: {self.my_hostname}", font=("Arial", 12, "bold"), text_color="#00A2FF").pack(pady=(5,0))
+        self.device_label = ctk.CTkLabel(self.my_info_frame, text=f"DEVICE NAME: {self.my_hostname}", font=("Arial", 12, "bold"), text_color="#00A2FF")
+        self.device_label.pack(pady=(5,0))
         self.info_inner = ctk.CTkFrame(self.my_info_frame, fg_color="transparent")
         self.info_inner.pack(pady=10)
-        ctk.CTkLabel(self.info_inner, text=f"IP: {self.my_ip}   |   TOKEN: ", font=("Arial", 16)).pack(side="left")
-        ctk.CTkLabel(self.info_inner, text=self.my_session_pin, font=("Courier New", 24, "bold"), text_color="yellow").pack(side="left")
+        self.ip_token_label = ctk.CTkLabel(self.info_inner, text=f"IP: {self.my_ip}   |   TOKEN: ", font=("Arial", 16))
+        self.ip_token_label.pack(side="left")
+        self.token_value_label = ctk.CTkLabel(self.info_inner, text=self.my_session_pin, font=("Courier New", 24, "bold"), text_color="yellow")
+        self.token_value_label.pack(side="left")
 
         self.target_frame = ctk.CTkFrame(self, corner_radius=10)
         self.target_frame.pack(pady=10, padx=20, fill="x")
-        ctk.CTkLabel(self.target_frame, text="SEND TO ANOTHER DEVICE", font=("Arial", 12, "bold"), text_color="gray").pack(pady=(5,0))
+        self.target_title = ctk.CTkLabel(self.target_frame, text="SEND TO ANOTHER DEVICE", font=("Arial", 12, "bold"), text_color="gray")
+        self.target_title.pack(pady=(5,0))
 
         self.target_inputs = ctk.CTkFrame(self.target_frame, fg_color="transparent")
         self.target_inputs.pack(pady=10)
@@ -117,7 +123,8 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.drop_zone = ctk.CTkFrame(self, width=400, height=130, corner_radius=15, border_width=2, border_color="gray")
         self.drop_zone.pack(pady=20, padx=20, fill="x")
         self.drop_zone.pack_propagate(False) 
-        ctk.CTkLabel(self.drop_zone, text="📁\nDrag & Drop File/Folder Here\nor Click Below to Select", font=("Arial", 16)).pack(expand=True)
+        self.drop_label = ctk.CTkLabel(self.drop_zone, text="📁\nDrag & Drop File/Folder Here\nor Click Below to Select", font=("Arial", 16))
+        self.drop_label.pack(expand=True)
         self.drop_zone.drop_target_register(DND_FILES)
         self.drop_zone.dnd_bind('<<Drop>>', self.handle_file_drop)
 
@@ -147,6 +154,48 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.bottom_btns.pack(pady=10)
         ctk.CTkButton(self.bottom_btns, text="Open Received Folder", width=180, command=self.open_folder).pack(side="left", padx=10)
         ctk.CTkButton(self.bottom_btns, text="Shutdown", fg_color="#8B0000", hover_color="#FF0000", width=120, command=self.quit_app).pack(side="left", padx=10)
+
+        self.apply_theme("Dark")
+
+    def on_appearance_change(self, mode):
+        ctk.set_appearance_mode(mode)
+        self.apply_theme()
+
+    def apply_theme(self, mode=None):
+        current_mode = (mode or ctk.get_appearance_mode()).lower()
+        is_light = current_mode == "light"
+
+        if is_light:
+            self.configure(fg_color="#EEF3F9")
+            self.my_info_frame.configure(fg_color="#FFFFFF", border_color="#0B66C3")
+            self.target_frame.configure(fg_color="#F7FAFF")
+            self.drop_zone.configure(fg_color="#FFFFFF", border_color="#9DB4CF")
+            self.log_box.configure(fg_color="#FFFFFF", text_color="#1C2A39", border_color="#B7C9DE", border_width=1)
+            self.settings_frame.configure(fg_color="transparent")
+
+            self.title_label.configure(text_color="#10243E")
+            self.device_label.configure(text_color="#0B66C3")
+            self.ip_token_label.configure(text_color="#1D3958")
+            self.token_value_label.configure(text_color="#0C8A2F")
+            self.target_title.configure(text_color="#486481")
+            self.drop_label.configure(text_color="#294A6C")
+            self.speed_label.configure(text_color="#294A6C")
+            self.dir_label.configure(text_color="#526C88")
+        else:
+            self.configure(fg_color=["gray92", "gray10"])
+            self.my_info_frame.configure(fg_color=["gray86", "gray16"], border_color="#00A2FF")
+            self.target_frame.configure(fg_color=["gray88", "gray18"])
+            self.drop_zone.configure(fg_color=["gray88", "gray18"], border_color="gray")
+            self.log_box.configure(fg_color=["gray92", "gray14"], text_color=["gray15", "gray90"], border_width=0)
+
+            self.title_label.configure(text_color=["gray10", "gray90"])
+            self.device_label.configure(text_color="#00A2FF")
+            self.ip_token_label.configure(text_color=["gray10", "gray90"])
+            self.token_value_label.configure(text_color="yellow")
+            self.target_title.configure(text_color="gray")
+            self.drop_label.configure(text_color=["gray10", "gray90"])
+            self.speed_label.configure(text_color=["gray20", "gray90"])
+            self.dir_label.configure(text_color="gray")
 
     def cancel_transfer(self):
         self.cancel_transfer_flag.set()
@@ -192,6 +241,15 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self.log_box.insert("end", f"[{time.strftime('%H:%M:%S')}] {message}\n")
             self.log_box.see("end")
             self.log_box.configure(state="disabled")
+
+    def log_info(self, message):
+        self.log(f"[INFO] {message}")
+
+    def log_warn(self, message):
+        self.log(f"[WARN] {message}")
+
+    def log_error(self, message):
+        self.log(f"[ERROR] {message}")
 
     def notify(self, title, message):
         if not self.shutdown_flag.is_set():
@@ -305,12 +363,24 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.transfer_approved = mb
         self.prompt_event.set()
 
+    def request_transfer_approval(self, title, message):
+        # Serialize prompts so concurrent incoming transfers do not race shared state.
+        with self.approval_lock:
+            self.prompt_event.clear()
+            self.transfer_approved = False
+            self.after(0, self.ask_approval, title, message)
+            self.prompt_event.wait()
+            return self.transfer_approved
+
     def handle_client(self, conn, addr):
         ip = addr[0]
         try:
+            conn.settimeout(SOCKET_TIMEOUT)
             if ip in self.failed_attempts:
                 attempts, lockout_time = self.failed_attempts[ip]
                 if time.time() < lockout_time:
+                    conn.sendall(b"AUTH_LOCKED")
+                    self.after(0, self.log_warn, f"Rejected connection from {ip}: temporary lockout active.")
                     conn.close()
                     return
                 elif time.time() >= lockout_time and attempts >= 3:
@@ -327,15 +397,30 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 attempts = self.failed_attempts.get(ip, (0, 0))[0] + 1
                 self.failed_attempts[ip] = (attempts, time.time() + 60 if attempts >= 3 else 0)
                 conn.sendall(b"AUTH_FAIL")
+                self.after(0, self.log_warn, f"Auth failed from {ip}. Attempt {attempts}/3.")
                 conn.close()
                 return
 
             if ip in self.failed_attempts: del self.failed_attempts[ip]
             conn.sendall(b"AUTH_OK")
 
-            meta = conn.recv(1024).decode().split("|")
-            if not meta or len(meta) < 5: return
-            f_name, f_size, f_hash, is_f, s_name = meta[0], int(meta[1]), meta[2], meta[3], meta[4]
+            meta = conn.recv(1024).decode().split("|", 4)
+            if not meta or len(meta) < 5:
+                conn.sendall(b"REJECT|META")
+                self.after(0, self.log_warn, f"Rejected malformed transfer metadata from {ip}.")
+                return
+            f_name, f_size_raw, f_hash, is_f, s_name = meta[0], meta[1], meta[2], meta[3], meta[4]
+            try:
+                f_size = int(f_size_raw)
+            except ValueError:
+                conn.sendall(b"REJECT|META")
+                self.after(0, self.log_warn, f"Rejected invalid file size from {ip}: {f_size_raw}")
+                return
+
+            if f_size < 0 or len(f_hash) != 64:
+                conn.sendall(b"REJECT|META")
+                self.after(0, self.log_warn, f"Rejected invalid metadata values from {ip}.")
+                return
 
             part_file = os.path.join(self.save_dir, f"{f_hash}.part")
             offset = 0
@@ -343,23 +428,29 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
             if os.path.exists(part_file):
                 offset = os.path.getsize(part_file)
                 if offset < f_size:
-                    self.prompt_event.clear()
-                    self.after(0, self.ask_approval, "Resume Transfer?", f"Resume receiving '{f_name}' from {s_name}? ({(offset/1e6):.1f}/{(f_size/1e6):.1f} MB already done)")
-                    self.prompt_event.wait()
+                    self.transfer_approved = self.request_transfer_approval(
+                        "Resume Transfer?",
+                        f"Resume receiving '{f_name}' from {s_name}? ({(offset/1e6):.1f}/{(f_size/1e6):.1f} MB already done)"
+                    )
                 else: offset = 0 
             else:
-                self.prompt_event.clear()
-                self.after(0, self.ask_approval, "Accept File?", f"Accept '{f_name}' ({(f_size/1e6):.2f} MB) from {s_name}?")
-                self.prompt_event.wait() 
+                self.transfer_approved = self.request_transfer_approval(
+                    "Accept File?",
+                    f"Accept '{f_name}' ({(f_size/1e6):.2f} MB) from {s_name}?"
+                )
 
             if not self.transfer_approved:
-                conn.sendall(b"REJECT")
+                conn.sendall(b"REJECT|DECLINED")
+                self.after(0, self.log_info, f"Declined transfer '{f_name}' from {s_name} ({ip}).")
                 return 
 
             if offset > 0: conn.sendall(f"RESUME|{offset}".encode())
             else: conn.sendall(b"START|0")
 
             nonce = self.recv_exact(conn, 16)
+            if len(nonce) != 16:
+                self.after(0, self.log_error, f"Invalid nonce received from {s_name} ({ip}).")
+                return
             decryptor = Cipher(algorithms.AES(key), modes.CTR(nonce)).decryptor()
             stream_mac = hmac.new(key, digestmod=hashlib.sha256)
             
@@ -388,16 +479,14 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
             if self.shutdown_flag.is_set(): return
 
             if rec < f_size:
-                self.after(0, self.log, "Transfer paused or connection dropped. Data saved to resume later.")
+                self.after(0, self.log_warn, "Transfer paused or connection dropped. Partial data kept for resume.")
                 return
 
             sender_mac = self.recv_exact(conn, 32)
             if not sender_mac or not hmac.compare_digest(stream_mac.digest(), sender_mac):
-                self.after(0, self.log, "🚨 SECURITY ALERT: Stream Tampering Detected! Segment dropped.")
+                self.after(0, self.log_error, "SECURITY ALERT: Stream MAC mismatch. Transfer dropped as unsafe.")
+                conn.sendall(b"FAIL")
                 return
-            
-            # Tell the sender we successfully received and verified the MAC
-            conn.sendall(b"DONE")
 
             if self.calculate_hash(part_file) == f_hash:
                 save_base, save_ext = os.path.splitext(f_name)
@@ -413,13 +502,24 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
                     fold = final_save_name.replace(".zip", "")
                     shutil.unpack_archive(final_save_name, fold)
                     os.remove(final_save_name)
+                
+                conn.sendall(b"DONE")
                     
-                self.after(0, self.log, "Transfer Success \u2705")
+                self.after(0, self.log_info, f"Transfer completed successfully: {f_name}")
                 self.after(0, self.notify, "Success", f"Received {f_name}")
-            else: self.after(0, self.log, "Corruption Detected \u274c")
+            else:
+                self.after(0, self.log_error, f"Hash mismatch for {f_name}. File rejected as corrupt.")
+                conn.sendall(b"FAIL")
+                try:
+                    os.remove(part_file)
+                except OSError:
+                    pass
 
+        except socket.timeout:
+            if not self.shutdown_flag.is_set():
+                self.after(0, self.log_warn, f"Connection with {ip} timed out.")
         except Exception as e: 
-            if not self.shutdown_flag.is_set(): self.after(0, self.log, f"Error: {e}")
+            if not self.shutdown_flag.is_set(): self.after(0, self.log_error, f"Receiver error from {ip}: {e}")
         finally: conn.close()
 
     def handle_file_drop(self, event):
@@ -481,9 +581,20 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         try:
             f_size, f_hash = os.path.getsize(send_path), self.calculate_hash(send_path)
             client = socket.socket()
+            client.settimeout(SOCKET_TIMEOUT)
+            self.after(0, self.log_info, f"Connecting to {target_ip}:{TCP_PORT}...")
             client.connect((target_ip, TCP_PORT))
             
             salt = client.recv(16)
+            if not salt:
+                self.after(0, self.log_error, "Connection closed before key exchange.")
+                return
+            if salt in (b"AUTH_LOCKED", b"AUTH_FAIL"):
+                self.after(0, self.log_warn, "Target is temporarily locked after failed token attempts.")
+                return
+            if len(salt) != 16:
+                self.after(0, self.log_error, f"Invalid salt length from target ({len(salt)} bytes).")
+                return
             kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=480000)
             key = kdf.derive(target_pin.encode())
             
@@ -491,10 +602,15 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
             client.sendall(my_auth)
             auth_resp = client.recv(1024)
             if auth_resp == b"AUTH_FAIL":
-                self.after(0, self.log, "Error: Incorrect Token!")
+                self.after(0, self.log_error, "Authentication failed: incorrect token.")
                 client.close()
                 return
-            elif auth_resp != b"AUTH_OK": return 
+            elif auth_resp == b"AUTH_LOCKED":
+                self.after(0, self.log_warn, "Target is temporarily locked after failed token attempts.")
+                return
+            elif auth_resp != b"AUTH_OK":
+                self.after(0, self.log_error, f"Unexpected auth response from target: {auth_resp!r}")
+                return 
 
             name_to_send = orig if is_f == "0" else (orig if orig.endswith(".zip") else orig + ".zip")
             client.sendall(f"{name_to_send}|{f_size}|{f_hash}|{is_f}|{self.my_hostname}".encode())
@@ -502,7 +618,16 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
             resp = client.recv(1024).decode().split("|")
             action = resp[0]
             if action == "REJECT":
-                self.after(0, self.log, "Rejected by target \u274c")
+                reason = resp[1] if len(resp) > 1 else "UNKNOWN"
+                reason_map = {
+                    "DECLINED": "recipient declined",
+                    "LOCKED": "recipient is temporarily locked after failed token attempts",
+                    "META": "recipient rejected malformed metadata",
+                }
+                self.after(0, self.log_warn, f"Transfer rejected by target: {reason_map.get(reason, reason)}.")
+                return
+            if action not in ("START", "RESUME"):
+                self.after(0, self.log_error, f"Unexpected transfer response: {resp}")
                 return
                 
             offset = int(resp[1]) if action == "RESUME" else 0
@@ -513,13 +638,13 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
             enc = Cipher(algorithms.AES(key), modes.CTR(nonce)).encryptor()
             stream_mac = hmac.new(key, digestmod=hashlib.sha256)
 
-            self.after(0, self.log, f"Sending to {target_ip} (Starting at {offset/1e6:.1f}MB)...")
+            self.after(0, self.log_info, f"Sending '{name_to_send}' to {target_ip} (starting at {offset/1e6:.1f} MB)...")
             with open(send_path, "rb") as f:
                 f.seek(offset)
                 sent, start = offset, time.time()
                 while chunk := f.read(8192):
                     if self.cancel_transfer_flag.is_set() or self.shutdown_flag.is_set():
-                        self.after(0, self.log, "Transfer paused.")
+                        self.after(0, self.log_warn, "Transfer paused by user.")
                         break
                         
                     enc_chunk = enc.update(chunk)
@@ -533,26 +658,35 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
                     self.after(0, self.update_ui_progress, pct, f"Speed: {speed:.2f} MB/s")
 
                 if not self.cancel_transfer_flag.is_set() and not self.shutdown_flag.is_set():
-                    # THE FIX IS HERE: Save to a variable so we only call finalize() once!
                     final_chunk = enc.finalize()
-                    client.sendall(final_chunk)
-                    stream_mac.update(final_chunk)
+                    if final_chunk:
+                        stream_mac.update(final_chunk)
+                        client.sendall(final_chunk)
                     client.sendall(stream_mac.digest())
                     
                     try:
-                        self.recv_exact(client, 4) 
-                    except:
-                        pass 
+                        ack = client.recv(4)
+                        if ack == b"DONE":
+                            self.after(0, self.log_info, "Sender confirmed delivery and integrity check passed.")
+                        elif ack == b"FAIL":
+                            self.after(0, self.log_error, "Receiver rejected transfer after integrity/hash verification.")
+                        else:
+                            self.after(0, self.log_warn, f"Transfer sent but ACK was unexpected: {ack!r}")
+                    except socket.timeout:
+                        self.after(0, self.log_warn, "Transfer sent but no ACK received before timeout.")
 
-                    self.after(0, self.log, "Sent Successfully! \u2705")
-
+        except socket.timeout:
+            if not self.shutdown_flag.is_set():
+                self.after(0, self.log_warn, f"Connection to {target_ip} timed out.")
         except Exception as e: 
-            if not self.shutdown_flag.is_set(): self.after(0, self.log, f"Failed: {e}")
+            if not self.shutdown_flag.is_set(): self.after(0, self.log_error, f"Sender failed: {e}")
         finally:
-            client.close()
+            if 'client' in locals():
+                client.close()
             self.after(0, self.update_ui_progress, 0, "Speed: 0.00 MB/s")
             self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
-            if is_f == "1": os.remove(send_path)
+            if is_f == "1" and os.path.exists(send_path):
+                os.remove(send_path)
 
 if __name__ == "__main__":
     app = MyFileSharingApp()
