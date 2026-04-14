@@ -104,7 +104,6 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.target_inputs = ctk.CTkFrame(self.target_frame, fg_color="transparent")
         self.target_inputs.pack(pady=10)
 
-        # ComboBox for Cross-Subnet saved contacts and discovered peers
         self.ip_entry = ctk.CTkComboBox(self.target_inputs, values=self.saved_contacts, width=150)
         self.ip_entry.pack(side="left", padx=5)
         self.ip_entry.set("")
@@ -160,19 +159,21 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.ip_entry.configure(values=all_ips)
 
     def prune_stale_peers(self):
-        # Keep-Alive Logic: Removes peers if not seen for 10 seconds
+        # Increased to 120 seconds (2 minutes) for a rock-solid UI
         while not self.shutdown_flag.is_set():
             now = time.time()
             changed = False
             for ip in list(self.discovered_peers.keys()):
-                if now - self.discovered_peers[ip] > 10:
+                if now - self.discovered_peers[ip] > 120: 
                     del self.discovered_peers[ip]
                     changed = True
                     if not self.shutdown_flag.is_set():
                         self.log(f"Device {ip} went offline.")
             if changed and not self.shutdown_flag.is_set(): 
                 self.after(0, self.update_peer_list)
-            time.sleep(3)
+            
+            # Checks every 5 seconds
+            time.sleep(5)
 
     def truncate_path(self, path, max_length=40):
         return path if len(path) <= max_length else f"...{path[-(max_length-3):]}"
@@ -243,14 +244,9 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.after(0, self.deiconify)
 
     def quit_app(self, icon=None, item=None):
-        # 1. Signal background threads to stop safely
         self.shutdown_flag.set()
-        
-        # 2. Kill tray icon
         if hasattr(self, 'tray_icon'): 
             self.tray_icon.stop()
-            
-        # 3. Hard exit to prevent Tkinter redraw crash
         os._exit(0)
 
     def broadcast_presence(self):
@@ -362,7 +358,7 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
             
             mode = "ab" if offset > 0 else "wb"
             self.after(0, self.log, f"Receiving {f_name} from {s_name} (Starting at {offset/1e6:.1f}MB)...")
-            self.after(0, self.cancel_btn.configure, state="normal")
+            self.after(0, lambda: self.cancel_btn.configure(state="normal"))
             
             with open(part_file, mode) as f:
                 rec, start_time = offset, time.time()
@@ -380,7 +376,7 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
                     self.after(0, self.update_ui_progress, pct, f"Speed: {speed:.2f} MB/s")
 
             self.after(0, self.update_ui_progress, 0, "Speed: 0.00 MB/s")
-            self.after(0, self.cancel_btn.configure, state="disabled")
+            self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
 
             if self.shutdown_flag.is_set(): return
 
@@ -460,7 +456,7 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def send_logic(self, file_path, target_ip, target_pin, is_batch=False):
         self.cancel_transfer_flag.clear()
-        self.after(0, self.cancel_btn.configure, state="normal")
+        self.after(0, lambda: self.cancel_btn.configure(state="normal"))
         
         is_f = "1" if is_batch else "0"
         orig = "batch_transfer.zip" if is_batch else os.path.basename(file_path)
@@ -537,7 +533,7 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         finally:
             client.close()
             self.after(0, self.update_ui_progress, 0, "Speed: 0.00 MB/s")
-            self.after(0, self.cancel_btn.configure, state="disabled")
+            self.after(0, lambda: self.cancel_btn.configure(state="disabled"))
             if is_f == "1": os.remove(send_path)
 
 if __name__ == "__main__":
