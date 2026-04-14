@@ -159,7 +159,6 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.ip_entry.configure(values=all_ips)
 
     def prune_stale_peers(self):
-        # Increased to 120 seconds (2 minutes) for a rock-solid UI
         while not self.shutdown_flag.is_set():
             now = time.time()
             changed = False
@@ -171,8 +170,6 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
                         self.log(f"Device {ip} went offline.")
             if changed and not self.shutdown_flag.is_set(): 
                 self.after(0, self.update_peer_list)
-            
-            # Checks every 5 seconds
             time.sleep(5)
 
     def truncate_path(self, path, max_length=40):
@@ -200,6 +197,16 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         if not self.shutdown_flag.is_set():
             try: notification.notify(title=title, message=message, app_name='MyFileSharing', timeout=5)
             except: pass
+
+    def recv_exact(self, sock, num_bytes):
+        """Ensures exactly num_bytes are received from the socket."""
+        data = b''
+        while len(data) < num_bytes:
+            packet = sock.recv(num_bytes - len(data))
+            if not packet:
+                break
+            data += packet
+        return data
 
     def get_local_ip(self):
         try:
@@ -384,10 +391,14 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 self.after(0, self.log, "Transfer paused or connection dropped. Data saved to resume later.")
                 return
 
-            sender_mac = conn.recv(32)
-            if not hmac.compare_digest(stream_mac.digest(), sender_mac):
+            # UPDATED SECURITY CHECK
+            sender_mac = self.recv_exact(conn, 32)
+            if not sender_mac or not hmac.compare_digest(stream_mac.digest(), sender_mac):
                 self.after(0, self.log, "🚨 SECURITY ALERT: Stream Tampering Detected! Segment dropped.")
                 return
+            
+            # Tell the sender we successfully received and verified the MAC
+            conn.sendall(b"DONE")
 
             if self.calculate_hash(part_file) == f_hash:
                 save_base, save_ext = os.path.splitext(f_name)
@@ -522,10 +533,18 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
                     speed = ((sent - offset) / 1e6) / elapsed
                     self.after(0, self.update_ui_progress, pct, f"Speed: {speed:.2f} MB/s")
 
+                # UPDATED CLOSING LOGIC
                 if not self.cancel_transfer_flag.is_set() and not self.shutdown_flag.is_set():
                     client.sendall(enc.finalize())
                     stream_mac.update(enc.finalize())
                     client.sendall(stream_mac.digest())
+                    
+                    # Wait for the receiver's thumbs up before closing the socket
+                    try:
+                        self.recv_exact(client, 4) # Waits for b"DONE"
+                    except:
+                        pass 
+
                     self.after(0, self.log, "Sent Successfully! \u2705")
 
         except Exception as e: 
