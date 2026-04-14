@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import hashlib
+import hmac
 import threading
 import shutil
 import secrets
@@ -10,6 +11,7 @@ import string
 import platform
 import subprocess
 import tempfile
+import json
 import tkinter.messagebox as messagebox
 import customtkinter as ctk
 from customtkinter import filedialog
@@ -24,6 +26,7 @@ from plyer import notification
 
 TCP_PORT = 49494
 UDP_PORT = 49495
+CONTACTS_FILE = "contacts.json"
 
 class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self):
@@ -31,10 +34,11 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.TkdndVersion = TkinterDnD._require(self)
 
         self.title("MyFileSharingSoftware")
-        self.geometry("550x920") 
+        self.geometry("550x980") 
         self.resizable(False, False)
         
         self.shutdown_flag = threading.Event()
+        self.cancel_transfer_flag = threading.Event()
         
         alphabet = string.ascii_uppercase + string.digits
         self.my_session_pin = ''.join(secrets.choice(alphabet) for _ in range(6))
@@ -42,107 +46,159 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.my_ip = self.get_local_ip()
         self.my_hostname = socket.gethostname()
         
+        self.failed_attempts = {}
+        self.discovered_peers = {} # {ip: timestamp}
+        self.saved_contacts = self.load_contacts()
+        
+        self.save_dir = os.path.join(os.path.expanduser("~"), "Downloads", "MyFileSharing")
+        os.makedirs(self.save_dir, exist_ok=True)
+        
         self.transfer_approved = False
         self.prompt_event = threading.Event()
 
         self.setup_ui()
-
         self.protocol("WM_DELETE_WINDOW", self.hide_window)
 
+        # Start Networking Threads
         threading.Thread(target=self.broadcast_presence, daemon=True).start()
         threading.Thread(target=self.start_tcp_server, daemon=True).start()
+        threading.Thread(target=self.scan_for_server, daemon=True).start()
+        threading.Thread(target=self.prune_stale_peers, daemon=True).start()
+
+    def load_contacts(self):
+        if os.path.exists(CONTACTS_FILE):
+            try:
+                with open(CONTACTS_FILE, "r") as f: return json.load(f)
+            except: return []
+        return []
+
+    def save_contact_action(self):
+        ip = self.ip_entry.get().strip()
+        if ip and ip not in self.saved_contacts:
+            self.saved_contacts.append(ip)
+            with open(CONTACTS_FILE, "w") as f: json.dump(self.saved_contacts, f)
+            self.update_peer_list()
+            self.notify("Saved", f"IP {ip} saved to contacts.")
 
     def setup_ui(self):
         self.title_label = ctk.CTkLabel(self, text="MyFileSharingSoftware", font=("Arial", 28, "bold"))
         self.title_label.pack(pady=(20, 10))
 
-        self.appearance_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.appearance_frame.pack(pady=5)
-        self.appearance_mode_optionemenu = ctk.CTkSegmentedButton(self.appearance_frame, 
-                                                               values=["Dark", "Light", "System"],
-                                                               command=self.change_appearance_mode_event)
+        self.appearance_mode_optionemenu = ctk.CTkSegmentedButton(self, values=["Dark", "Light", "System"], command=ctk.set_appearance_mode)
         self.appearance_mode_optionemenu.set("Dark")
-        self.appearance_mode_optionemenu.pack()
+        self.appearance_mode_optionemenu.pack(pady=5)
 
         self.my_info_frame = ctk.CTkFrame(self, corner_radius=10, border_width=1, border_color="#00A2FF")
         self.my_info_frame.pack(pady=15, padx=20, fill="x")
         
         ctk.CTkLabel(self.my_info_frame, text=f"DEVICE NAME: {self.my_hostname}", font=("Arial", 12, "bold"), text_color="#00A2FF").pack(pady=(5,0))
-        
         self.info_inner = ctk.CTkFrame(self.my_info_frame, fg_color="transparent")
         self.info_inner.pack(pady=10)
-        
-        self.info_text = ctk.CTkLabel(self.info_inner, text=f"IP: {self.my_ip}   |   TOKEN: ", font=("Arial", 16))
-        self.info_text.pack(side="left")
-        
-        self.pin_label = ctk.CTkLabel(self.info_inner, text=self.my_session_pin, font=("Courier New", 24, "bold"), text_color="yellow")
-        self.pin_label.pack(side="left")
+        ctk.CTkLabel(self.info_inner, text=f"IP: {self.my_ip}   |   TOKEN: ", font=("Arial", 16)).pack(side="left")
+        ctk.CTkLabel(self.info_inner, text=self.my_session_pin, font=("Courier New", 24, "bold"), text_color="yellow").pack(side="left")
 
         self.target_frame = ctk.CTkFrame(self, corner_radius=10)
         self.target_frame.pack(pady=10, padx=20, fill="x")
-        
         ctk.CTkLabel(self.target_frame, text="SEND TO ANOTHER DEVICE", font=("Arial", 12, "bold"), text_color="gray").pack(pady=(5,0))
 
         self.target_inputs = ctk.CTkFrame(self.target_frame, fg_color="transparent")
         self.target_inputs.pack(pady=10)
 
-        self.ip_entry = ctk.CTkEntry(self.target_inputs, placeholder_text="Target IP Address", width=180)
+        # ComboBox for Cross-Subnet saved contacts and discovered peers
+        self.ip_entry = ctk.CTkComboBox(self.target_inputs, values=self.saved_contacts, width=150)
         self.ip_entry.pack(side="left", padx=5)
+        self.ip_entry.set("")
         
-        self.scan_btn = ctk.CTkButton(self.target_inputs, text="Scan", command=self.start_scan_thread, width=60)
-        self.scan_btn.pack(side="left", padx=5)
+        self.save_btn = ctk.CTkButton(self.target_inputs, text="Save IP", command=self.save_contact_action, width=60)
+        self.save_btn.pack(side="left", padx=2)
 
-        self.pin_entry = ctk.CTkEntry(self.target_inputs, placeholder_text="6-Char Token", width=110, justify="center")
+        self.pin_entry = ctk.CTkEntry(self.target_inputs, placeholder_text="6-Char Token", width=100, justify="center")
         self.pin_entry.pack(side="left", padx=5)
 
         self.drop_zone = ctk.CTkFrame(self, width=400, height=130, corner_radius=15, border_width=2, border_color="gray")
         self.drop_zone.pack(pady=20, padx=20, fill="x")
         self.drop_zone.pack_propagate(False) 
-
-        self.drop_label = ctk.CTkLabel(self.drop_zone, text="📁\nDrag & Drop File/Folder Here\nor Click Below to Select", font=("Arial", 16))
-        self.drop_label.pack(expand=True)
-
+        ctk.CTkLabel(self.drop_zone, text="📁\nDrag & Drop File/Folder Here\nor Click Below to Select", font=("Arial", 16)).pack(expand=True)
         self.drop_zone.drop_target_register(DND_FILES)
         self.drop_zone.dnd_bind('<<Drop>>', self.handle_file_drop)
 
-        self.manual_btn = ctk.CTkButton(self, text="Select File/Folder Manually", font=("Arial", 14), 
-                                      height=40, width=220, command=self.select_file)
+        self.manual_btn = ctk.CTkButton(self, text="Select File(s) Manually", font=("Arial", 14), height=40, width=220, command=self.select_file)
         self.manual_btn.pack(pady=5)
-
-        self.status_label = ctk.CTkLabel(self, text="Status: Online", text_color="green")
-        self.status_label.pack(pady=(15, 0))
 
         self.progress = ctk.CTkProgressBar(self, width=450)
         self.progress.set(0)
-        self.progress.pack(pady=10)
+        self.progress.pack(pady=(15,5))
 
         self.speed_label = ctk.CTkLabel(self, text="Speed: 0.00 MB/s", font=("Arial", 12))
         self.speed_label.pack(pady=0)
+        
+        self.cancel_btn = ctk.CTkButton(self, text="Pause / Cancel Transfer", fg_color="#555555", hover_color="#8B0000", height=24, width=150, state="disabled", command=self.cancel_transfer)
+        self.cancel_btn.pack(pady=5)
 
-        self.log_box = ctk.CTkTextbox(self, height=100, state="disabled")
-        self.log_box.pack(pady=15, padx=20, fill="x")
+        self.log_box = ctk.CTkTextbox(self, height=90, state="disabled")
+        self.log_box.pack(pady=10, padx=20, fill="x")
+
+        self.settings_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.settings_frame.pack(pady=5)
+        self.dir_label = ctk.CTkLabel(self.settings_frame, text=f"Save to: {self.truncate_path(self.save_dir)}", font=("Arial", 11), text_color="gray")
+        self.dir_label.pack(side="left", padx=10)
+        ctk.CTkButton(self.settings_frame, text="Change", width=60, height=24, command=self.change_save_dir).pack(side="left")
 
         self.bottom_btns = ctk.CTkFrame(self, fg_color="transparent")
         self.bottom_btns.pack(pady=10)
+        ctk.CTkButton(self.bottom_btns, text="Open Received Folder", width=180, command=self.open_folder).pack(side="left", padx=10)
+        ctk.CTkButton(self.bottom_btns, text="Shutdown", fg_color="#8B0000", hover_color="#FF0000", width=120, command=self.quit_app).pack(side="left", padx=10)
 
-        self.open_folder_btn = ctk.CTkButton(self.bottom_btns, text="Open Received Folder", width=180, command=self.open_folder)
-        self.open_folder_btn.pack(side="left", padx=10)
+    def cancel_transfer(self):
+        self.cancel_transfer_flag.set()
+        self.log("Interrupting transfer...")
 
-        self.quit_btn = ctk.CTkButton(self.bottom_btns, text="Shutdown", fg_color="#8B0000", hover_color="#FF0000", width=120, command=self.quit_app)
-        self.quit_btn.pack(side="left", padx=10)
+    def update_peer_list(self):
+        if self.shutdown_flag.is_set(): return
+        active_ips = list(self.discovered_peers.keys())
+        all_ips = list(set(self.saved_contacts + active_ips))
+        self.ip_entry.configure(values=all_ips)
 
-    def change_appearance_mode_event(self, mode: str):
-        ctk.set_appearance_mode(mode)
+    def prune_stale_peers(self):
+        # Keep-Alive Logic: Removes peers if not seen for 10 seconds
+        while not self.shutdown_flag.is_set():
+            now = time.time()
+            changed = False
+            for ip in list(self.discovered_peers.keys()):
+                if now - self.discovered_peers[ip] > 10:
+                    del self.discovered_peers[ip]
+                    changed = True
+                    if not self.shutdown_flag.is_set():
+                        self.log(f"Device {ip} went offline.")
+            if changed and not self.shutdown_flag.is_set(): 
+                self.after(0, self.update_peer_list)
+            time.sleep(3)
+
+    def truncate_path(self, path, max_length=40):
+        return path if len(path) <= max_length else f"...{path[-(max_length-3):]}"
+
+    def change_save_dir(self):
+        new_dir = filedialog.askdirectory(initialdir=self.save_dir)
+        if new_dir:
+            self.save_dir = new_dir
+            self.dir_label.configure(text=f"Save to: {self.truncate_path(self.save_dir)}")
+
+    def update_ui_progress(self, pct, speed_text):
+        if not self.shutdown_flag.is_set():
+            self.progress.set(pct)
+            self.speed_label.configure(text=speed_text)
 
     def log(self, message):
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", f"[{time.strftime('%H:%M:%S')}] {message}\n")
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
+        if not self.shutdown_flag.is_set():
+            self.log_box.configure(state="normal")
+            self.log_box.insert("end", f"[{time.strftime('%H:%M:%S')}] {message}\n")
+            self.log_box.see("end")
+            self.log_box.configure(state="disabled")
 
     def notify(self, title, message):
-        try: notification.notify(title=title, message=message, app_name='MyFileSharing', timeout=5)
-        except: pass
+        if not self.shutdown_flag.is_set():
+            try: notification.notify(title=title, message=message, app_name='MyFileSharing', timeout=5)
+            except: pass
 
     def get_local_ip(self):
         try:
@@ -154,9 +210,8 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         except: return "127.0.0.1"
 
     def open_folder(self):
-        path = os.getcwd()
-        if platform.system() == "Windows": os.startfile(path)
-        else: subprocess.Popen(["open" if platform.system() == "Darwin" else "xdg-open", path])
+        if platform.system() == "Windows": os.startfile(self.save_dir)
+        else: subprocess.Popen(["open" if platform.system() == "Darwin" else "xdg-open", self.save_dir])
 
     def calculate_hash(self, filepath):
         sha256 = hashlib.sha256()
@@ -165,23 +220,18 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         return sha256.hexdigest()
 
     def create_tray_icon(self):
-        try:
-            image = Image.open("icon.png") 
+        try: image = Image.open("icon.png") 
         except:
             image = Image.new('RGB', (64, 64), (0, 162, 255))
             d = ImageDraw.Draw(image)
             d.rectangle((16, 16, 48, 48), fill=(255, 255, 255))
-        
-        menu = pystray.Menu(
-            item('Show App', self.show_window, default=True), 
-            item('Quit Completely', self.quit_app)
-        )
+        menu = pystray.Menu(item('Show App', self.show_window, default=True), item('Quit Completely', self.quit_app))
         self.tray_icon = pystray.Icon("MyFileSharing", image, "MyFileSharingSoftware", menu)
         self.tray_icon.run()
 
     def hide_window(self):
         self.withdraw()
-        self.notify("Minimized", "App is still listening for files in the system tray.")
+        self.notify("Minimized", "Listening in background.")
         if not hasattr(self, 'tray_thread'):
             self.tray_thread = threading.Thread(target=self.create_tray_icon, daemon=True)
             self.tray_thread.start()
@@ -193,9 +243,14 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.after(0, self.deiconify)
 
     def quit_app(self, icon=None, item=None):
+        # 1. Signal background threads to stop safely
         self.shutdown_flag.set()
-        if hasattr(self, 'tray_icon'): self.tray_icon.stop()
-        self.destroy()
+        
+        # 2. Kill tray icon
+        if hasattr(self, 'tray_icon'): 
+            self.tray_icon.stop()
+            
+        # 3. Hard exit to prevent Tkinter redraw crash
         os._exit(0)
 
     def broadcast_presence(self):
@@ -203,11 +258,30 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
         udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         while not self.shutdown_flag.is_set():
             try:
-                msg = f"FILE_SERVER_HERE|{self.my_hostname}"
-                udp_sock.sendto(msg.encode(), ("<broadcast>", UDP_PORT))
+                udp_sock.sendto(f"FILE_SERVER_HERE|{self.my_hostname}".encode(), ("<broadcast>", UDP_PORT))
                 time.sleep(2)
             except: break
         udp_sock.close()
+
+    def scan_for_server(self):
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if sys.platform == "win32": udp.bind(("", UDP_PORT))
+        else: udp.bind(("<broadcast>", UDP_PORT))
+        udp.settimeout(2.0)
+        while not self.shutdown_flag.is_set():
+            try:
+                data, addr = udp.recvfrom(1024)
+                msg = data.decode().split("|")
+                if msg[0] == "FILE_SERVER_HERE" and addr[0] != self.my_ip:
+                    is_new = addr[0] not in self.discovered_peers
+                    self.discovered_peers[addr[0]] = time.time()
+                    if is_new and not self.shutdown_flag.is_set():
+                        self.after(0, self.log, f"Found '{msg[1]}' at {addr[0]} \u2705")
+                        self.after(0, self.update_peer_list)
+            except socket.timeout: continue
+            except: break
+        udp.close()
 
     def start_tcp_server(self):
         server = socket.socket()
@@ -222,91 +296,160 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
             except socket.timeout: continue
         server.close()
 
-    def ask_approval(self, file_name, file_size, sender_name):
-        self.notify("Incoming File", f"{sender_name} wants to send a file.")
-        mb = messagebox.askyesno("Accept File?", f"Accept '{file_name}' ({(file_size/1e6):.2f} MB) from {sender_name}?")
+    def ask_approval(self, prompt_title, prompt_msg):
+        self.notify("Incoming File", prompt_msg)
+        mb = messagebox.askyesno(prompt_title, prompt_msg)
         self.transfer_approved = mb
         self.prompt_event.set()
 
     def handle_client(self, conn, addr):
         ip = addr[0]
         try:
+            if ip in self.failed_attempts:
+                attempts, lockout_time = self.failed_attempts[ip]
+                if time.time() < lockout_time:
+                    conn.close()
+                    return
+                elif time.time() >= lockout_time and attempts >= 3:
+                    del self.failed_attempts[ip]
+
             salt = os.urandom(16)
             conn.sendall(salt)
             kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=480000)
             key = kdf.derive(self.my_session_pin.encode())
 
-            meta = conn.recv(1024).decode().split("|")
-            if not meta: return
-            
-            f_name, f_size, f_hash, nonce_hex, is_f, s_name = meta[0], int(meta[1]), meta[2], meta[3], meta[4], meta[5]
+            client_auth = conn.recv(32)
+            expected_auth = hmac.new(key, b"AUTH_CHALLENGE", hashlib.sha256).digest()
+            if not hmac.compare_digest(client_auth, expected_auth):
+                attempts = self.failed_attempts.get(ip, (0, 0))[0] + 1
+                self.failed_attempts[ip] = (attempts, time.time() + 60 if attempts >= 3 else 0)
+                conn.sendall(b"AUTH_FAIL")
+                conn.close()
+                return
 
-            self.prompt_event.clear()
-            self.after(0, self.ask_approval, f_name, f_size, s_name)
-            self.prompt_event.wait() 
+            if ip in self.failed_attempts: del self.failed_attempts[ip]
+            conn.sendall(b"AUTH_OK")
+
+            meta = conn.recv(1024).decode().split("|")
+            if not meta or len(meta) < 5: return
+            f_name, f_size, f_hash, is_f, s_name = meta[0], int(meta[1]), meta[2], meta[3], meta[4]
+
+            part_file = os.path.join(self.save_dir, f"{f_hash}.part")
+            offset = 0
+            
+            if os.path.exists(part_file):
+                offset = os.path.getsize(part_file)
+                if offset < f_size:
+                    self.prompt_event.clear()
+                    self.after(0, self.ask_approval, "Resume Transfer?", f"Resume receiving '{f_name}' from {s_name}? ({(offset/1e6):.1f}/{(f_size/1e6):.1f} MB already done)")
+                    self.prompt_event.wait()
+                else: offset = 0 
+            else:
+                self.prompt_event.clear()
+                self.after(0, self.ask_approval, "Accept File?", f"Accept '{f_name}' ({(f_size/1e6):.2f} MB) from {s_name}?")
+                self.prompt_event.wait() 
 
             if not self.transfer_approved:
                 conn.sendall(b"REJECT")
                 return 
 
-            conn.sendall(b"OK")
-            save_name = "recv_" + f_name
-            decryptor = Cipher(algorithms.AES(key), modes.CTR(bytes.fromhex(nonce_hex))).decryptor()
+            if offset > 0: conn.sendall(f"RESUME|{offset}".encode())
+            else: conn.sendall(b"START|0")
 
-            self.log(f"Receiving {f_name} from {s_name}...")
-            with open(save_name, "wb") as f:
-                rec = 0
-                while rec < f_size:
+            nonce = conn.recv(16)
+            decryptor = Cipher(algorithms.AES(key), modes.CTR(nonce)).decryptor()
+            stream_mac = hmac.new(key, digestmod=hashlib.sha256)
+            
+            mode = "ab" if offset > 0 else "wb"
+            self.after(0, self.log, f"Receiving {f_name} from {s_name} (Starting at {offset/1e6:.1f}MB)...")
+            self.after(0, self.cancel_btn.configure, state="normal")
+            
+            with open(part_file, mode) as f:
+                rec, start_time = offset, time.time()
+                while rec < f_size and not self.shutdown_flag.is_set():
                     data = conn.recv(min(8192, f_size - rec))
-                    if not data: break
+                    if not data: break 
+                    
+                    stream_mac.update(data)
                     f.write(decryptor.update(data))
                     rec += len(data)
-                f.write(decryptor.finalize())
 
-            if self.calculate_hash(save_name) == f_hash:
+                    elapsed = max(0.1, time.time() - start_time)
+                    pct = rec / f_size if f_size > 0 else 1
+                    speed = ((rec - offset) / 1e6) / elapsed
+                    self.after(0, self.update_ui_progress, pct, f"Speed: {speed:.2f} MB/s")
+
+            self.after(0, self.update_ui_progress, 0, "Speed: 0.00 MB/s")
+            self.after(0, self.cancel_btn.configure, state="disabled")
+
+            if self.shutdown_flag.is_set(): return
+
+            if rec < f_size:
+                self.after(0, self.log, "Transfer paused or connection dropped. Data saved to resume later.")
+                return
+
+            sender_mac = conn.recv(32)
+            if not hmac.compare_digest(stream_mac.digest(), sender_mac):
+                self.after(0, self.log, "🚨 SECURITY ALERT: Stream Tampering Detected! Segment dropped.")
+                return
+
+            if self.calculate_hash(part_file) == f_hash:
+                save_base, save_ext = os.path.splitext(f_name)
+                final_save_name = os.path.join(self.save_dir, f_name)
+                counter = 1
+                while os.path.exists(final_save_name):
+                    final_save_name = os.path.join(self.save_dir, f"{save_base} ({counter}){save_ext}")
+                    counter += 1
+                
+                os.rename(part_file, final_save_name)
+
                 if is_f == "1":
-                    fold = f_name.replace(".zip", "")
-                    shutil.unpack_archive(save_name, fold)
-                    os.remove(save_name)
-                self.log("Transfer Success \u2705")
-                self.notify("Success", f"Received {f_name}")
-            else: self.log("Corruption Detected \u274c")
+                    fold = final_save_name.replace(".zip", "")
+                    shutil.unpack_archive(final_save_name, fold)
+                    os.remove(final_save_name)
+                    
+                self.after(0, self.log, "Transfer Success \u2705")
+                self.after(0, self.notify, "Success", f"Received {f_name}")
+            else: self.after(0, self.log, "Corruption Detected \u274c")
 
-        except Exception as e: self.log(f"Error: {e}")
+        except Exception as e: 
+            if not self.shutdown_flag.is_set(): self.after(0, self.log, f"Error: {e}")
         finally: conn.close()
 
-    def start_scan_thread(self):
-        self.scan_btn.configure(state="disabled")
-        threading.Thread(target=self.scan_for_server, daemon=True).start()
-
-    def scan_for_server(self):
-        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if sys.platform == "win32": udp.bind(("", UDP_PORT))
-        else: udp.bind(("<broadcast>", UDP_PORT))
-        udp.settimeout(4.0)
-        try:
-            while True:
-                data, addr = udp.recvfrom(1024)
-                msg = data.decode().split("|")
-                if msg[0] == "FILE_SERVER_HERE" and addr[0] != self.my_ip:
-                    self.log(f"Found '{msg[1]}' at {addr[0]} \u2705")
-                    self.ip_entry.delete(0, "end")
-                    self.ip_entry.insert(0, addr[0])
-                    break
-        except: self.log("No other users found.")
-        finally:
-            udp.close()
-            self.scan_btn.configure(state="normal")
-
     def handle_file_drop(self, event):
-        p = event.data
-        if p.startswith('{'): p = p[1:-1]
-        self.trigger_transfer(p)
+        files = self.tk.splitlist(event.data)
+        if not files: return
+        if len(files) == 1: self.trigger_transfer(files[0])
+        else:
+            self.log(f"Zipping {len(files)} files for transfer...")
+            threading.Thread(target=self._zip_and_transfer_multiple, args=(files,), daemon=True).start()
 
     def select_file(self):
-        p = filedialog.askopenfilename() or filedialog.askdirectory()
-        if p: self.trigger_transfer(p)
+        paths = filedialog.askopenfilenames()
+        if not paths:
+            path = filedialog.askdirectory()
+            if path: self.trigger_transfer(path)
+            return
+        if len(paths) == 1: self.trigger_transfer(paths[0])
+        else:
+            self.log(f"Zipping {len(paths)} files for transfer...")
+            threading.Thread(target=self._zip_and_transfer_multiple, args=(paths,), daemon=True).start()
+
+    def _zip_and_transfer_multiple(self, files):
+        tip, tpin = self.ip_entry.get().strip(), self.pin_entry.get().strip()
+        if not tip or not tpin:
+            self.after(0, self.log, "Error: Check IP and Token")
+            return
+        temp_dir = tempfile.mkdtemp()
+        try:
+            for f in files:
+                if os.path.isfile(f): shutil.copy2(f, temp_dir)
+                elif os.path.isdir(f): shutil.copytree(f, os.path.join(temp_dir, os.path.basename(f)))
+            temp_zip = os.path.join(tempfile.gettempdir(), f"batch_transfer_{secrets.token_hex(4)}")
+            send_path = shutil.make_archive(temp_zip, 'zip', temp_dir)
+            self.send_logic(send_path, tip, tpin, is_batch=True)
+        except Exception as e: self.after(0, self.log, f"Error packing files: {e}")
+        finally: shutil.rmtree(temp_dir, ignore_errors=True)
 
     def trigger_transfer(self, file_path):
         tip, tpin = self.ip_entry.get().strip(), self.pin_entry.get().strip()
@@ -315,44 +458,86 @@ class MyFileSharingApp(ctk.CTk, TkinterDnD.DnDWrapper):
             return
         threading.Thread(target=self.send_logic, args=(file_path, tip, tpin), daemon=True).start()
 
-    def send_logic(self, file_path, target_ip, target_pin):
-        is_f, orig = "0", os.path.basename(file_path)
+    def send_logic(self, file_path, target_ip, target_pin, is_batch=False):
+        self.cancel_transfer_flag.clear()
+        self.after(0, self.cancel_btn.configure, state="normal")
+        
+        is_f = "1" if is_batch else "0"
+        orig = "batch_transfer.zip" if is_batch else os.path.basename(file_path)
         send_path = file_path
         
-        if os.path.isdir(file_path):
-            self.log("Zipping folder...")
+        if os.path.isdir(file_path) and not is_batch:
+            self.after(0, self.log, "Zipping folder...")
             temp_name = os.path.join(tempfile.gettempdir(), f"transfer_{secrets.token_hex(4)}")
             send_path = shutil.make_archive(temp_name, 'zip', file_path)
             is_f = "1"
 
         try:
-            f_size, f_hash, nonce = os.path.getsize(send_path), self.calculate_hash(send_path), os.urandom(16)
+            f_size, f_hash = os.path.getsize(send_path), self.calculate_hash(send_path)
             client = socket.socket()
             client.connect((target_ip, TCP_PORT))
+            
             salt = client.recv(16)
             kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=480000)
             key = kdf.derive(target_pin.encode())
-            enc = Cipher(algorithms.AES(key), modes.CTR(nonce)).encryptor()
-
-            name_to_send = orig if is_f == "0" else orig + ".zip"
-            client.sendall(f"{name_to_send}|{f_size}|{f_hash}|{nonce.hex()}|{is_f}|{self.my_hostname}".encode())
             
-            if client.recv(1024).decode() == "OK":
-                self.log(f"Sending to {target_ip}...")
-                with open(send_path, "rb") as f:
-                    sent, start = 0, time.time()
-                    while chunk := f.read(8192):
-                        client.sendall(enc.update(chunk))
-                        sent += len(chunk)
-                        self.progress.set(sent/f_size)
-                        self.speed_label.configure(text=f"{(sent/1e6)/(max(0.1, time.time()-start)):.2f} MB/s")
+            my_auth = hmac.new(key, b"AUTH_CHALLENGE", hashlib.sha256).digest()
+            client.sendall(my_auth)
+            auth_resp = client.recv(1024)
+            if auth_resp == b"AUTH_FAIL":
+                self.after(0, self.log, "Error: Incorrect Token!")
+                client.close()
+                return
+            elif auth_resp != b"AUTH_OK": return 
+
+            name_to_send = orig if is_f == "0" else (orig if orig.endswith(".zip") else orig + ".zip")
+            client.sendall(f"{name_to_send}|{f_size}|{f_hash}|{is_f}|{self.my_hostname}".encode())
+            
+            resp = client.recv(1024).decode().split("|")
+            action = resp[0]
+            if action == "REJECT":
+                self.after(0, self.log, "Rejected by target \u274c")
+                return
+                
+            offset = int(resp[1]) if action == "RESUME" else 0
+            
+            nonce = os.urandom(16)
+            client.sendall(nonce)
+
+            enc = Cipher(algorithms.AES(key), modes.CTR(nonce)).encryptor()
+            stream_mac = hmac.new(key, digestmod=hashlib.sha256)
+
+            self.after(0, self.log, f"Sending to {target_ip} (Starting at {offset/1e6:.1f}MB)...")
+            with open(send_path, "rb") as f:
+                f.seek(offset)
+                sent, start = offset, time.time()
+                while chunk := f.read(8192):
+                    if self.cancel_transfer_flag.is_set() or self.shutdown_flag.is_set():
+                        self.after(0, self.log, "Transfer paused.")
+                        break
+                        
+                    enc_chunk = enc.update(chunk)
+                    stream_mac.update(enc_chunk)
+                    client.sendall(enc_chunk)
+                    
+                    sent += len(chunk)
+                    elapsed = max(0.1, time.time() - start)
+                    pct = sent / f_size if f_size > 0 else 1
+                    speed = ((sent - offset) / 1e6) / elapsed
+                    self.after(0, self.update_ui_progress, pct, f"Speed: {speed:.2f} MB/s")
+
+                if not self.cancel_transfer_flag.is_set() and not self.shutdown_flag.is_set():
                     client.sendall(enc.finalize())
-                self.log("Sent Successfully! \u2705")
-            else: self.log("Rejected by target \u274c")
-        except Exception as e: self.log(f"Failed: {e}")
+                    stream_mac.update(enc.finalize())
+                    client.sendall(stream_mac.digest())
+                    self.after(0, self.log, "Sent Successfully! \u2705")
+
+        except Exception as e: 
+            if not self.shutdown_flag.is_set(): self.after(0, self.log, f"Failed: {e}")
         finally:
             client.close()
-            self.progress.set(0)
+            self.after(0, self.update_ui_progress, 0, "Speed: 0.00 MB/s")
+            self.after(0, self.cancel_btn.configure, state="disabled")
             if is_f == "1": os.remove(send_path)
 
 if __name__ == "__main__":
